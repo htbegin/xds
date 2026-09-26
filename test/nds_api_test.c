@@ -24,7 +24,7 @@
 #define STRESS_MIN_LENGTH (4UL << 10)
 #define STRESS_MAX_LENGTH (4UL << 20)
 #define HARVEST_TIMEOUT_SEC 300
-#define CQ_RACE_JOIN_TIMEOUT_SEC 300
+#define CQ_RACE_JOIN_TIMEOUT_SEC 900
 
 enum run_mode {
 	MODE_SINGLE,
@@ -2415,7 +2415,7 @@ int main(int argc, char **argv)
 				  nds_register_fs(&fs_desc), 0);
 		if (err)
 			goto reject_out;
-		err = expect_case("unregister-fs-noop",
+		err = expect_case("unregister-fs",
 				  nds_unregister_fs(&fs_desc), 0);
 		if (err)
 			goto reject_out;

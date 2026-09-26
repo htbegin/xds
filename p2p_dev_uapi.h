@@ -18,10 +18,14 @@ struct p2p_iov {
 #define P2P_IO_READ 0U
 #define P2P_IO_WRITE 1U
 
+/* Raw extent access; shared extents are permitted only for reads. */
+#define P2P_FIEMAP_SUPPORTED_FLAGS \
+	(FIEMAP_EXTENT_LAST | FIEMAP_EXTENT_MERGED | FIEMAP_EXTENT_UNWRITTEN | FIEMAP_EXTENT_SHARED)
+
 /*
  * Fixed-size request; iov and extents are userspace pointers.
- * One IOCTL_RW_FILE is one logical I/O covering all iov/extents and
- * completing as one event carrying user_data.
+ * One batch item is one logical I/O covering all iov/extents and completing
+ * as one event carrying user_data.
  */
 struct p2p_io_param {
 	unsigned int op;
@@ -35,6 +39,20 @@ struct p2p_io_param {
 	unsigned int ext_nr;
 	__u64 extents;            /* userspace pointer to struct fiemap_extent[] */
 	__u64 reserved[3];           /* must be zero */
+};
+
+#define P2P_MAX_IO_NR 1024U
+
+/*
+ * Submit independent p2p_io_param records in array order. The ioctl stops at
+ * the first item that cannot be accepted and returns the accepted prefix, or
+ * a negative errno when the first item fails. Each accepted item produces one
+ * completion event.
+ */
+struct p2p_io_batch_param {
+	__u64 items;              /* userspace pointer to p2p_io_param[] */
+	__u32 nr;
+	__u32 reserved;
 };
 
 struct p2p_io_event {
@@ -63,7 +81,7 @@ struct p2p_mem_unregister_param {
 };
 
 #define P2P_TOPO_NAME_LEN 32
-#define P2P_TOPO_MAX_BDEVS 4
+#define P2P_TOPO_MAX_BDEVS 16
 
 struct topo_user_bdev {
 	__u32 dev_id;
@@ -87,8 +105,14 @@ struct topo_user_cfg {
 	struct topo_user_bdev bdevs[];
 };
 
+/* Delete one topology pin from the fd receiving IOCTL_DEL_TOPO. */
+struct topo_del_cfg {
+	__u32 top_dev;
+	__u32 reserved;
+};
+
 #define IOCTL_ADD_TOPO _IOW('k', 1, struct topo_user_cfg)
-#define IOCTL_RW_FILE _IOWR('k', 2, struct p2p_io_param)
+#define IOCTL_SUBMIT_IO _IOWR('k', 2, struct p2p_io_batch_param)
 /*
  * Drain snapshots I/O contexts already published by read/write ioctls. An I/O
  * or another drain that overlaps this ioctl need not be covered by its wait.
@@ -97,5 +121,6 @@ struct topo_user_cfg {
 #define IOCTL_REGISTER_MEM _IOWR('k', 4, struct p2p_mem_register_param)
 #define IOCTL_UNREGISTER_MEM _IOW('k', 5, struct p2p_mem_unregister_param)
 #define IOCTL_GET_IO_EVENTS _IOWR('k', 6, struct p2p_getevents_param)
+#define IOCTL_DEL_TOPO _IOW('k', 7, struct topo_del_cfg)
 
 #endif

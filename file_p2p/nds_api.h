@@ -76,6 +76,8 @@ struct nds_init_param {
  * v1: fs_fd_cnt must be at least 1. Every entry is a regular-file or
  * block-device fd whose underlying block device is registered via add_topo
  * for the process. Additional descriptors may be registered after nds_init.
+ * Discovery uses the fd device ID and sysfs; no target /dev node is needed.
+ * dm-linear discovery also requires access to /dev/mapper/control.
  */
 struct nds_fs_desc {
 	int32_t *fs_fd;
@@ -102,7 +104,7 @@ struct nds_io_obj {
 };
 
 #define NDS_IO_OP_PREAD  0u	/* read one or more buffers */
-#define NDS_IO_OP_PWRITE 1u	/* write one or more buffers (block dev only) */
+#define NDS_IO_OP_PWRITE 1u /* write one or more buffers */
 
 /* Buffer was previously registered with nds_register_mem(). */
 #define NDS_IO_F_REGISTERED_MEM (1u << 0)
@@ -121,6 +123,12 @@ struct nds_io_vec {
  * With NDS_IO_F_REGISTERED_MEM, iov[0] selects a region previously passed to
  * nds_register_mem(); the kernel requires every vector to fit that region.
  * Otherwise buffers are one-shot.
+ *
+ * Regular writes preallocate before FIEMAP, even if later submission fails.
+ * File I/O accesses raw extents, including unwritten extents, without cache
+ * coherence or unwritten conversion. Only successfully XDS-written ranges
+ * are valid for raw readback; normal file reads may still return zeros.
+ * Callers must exclusively manage files and keep mappings stable through I/O.
  */
 struct nds_io_cb {
 	uint32_t opcode;		/* NDS_IO_OP_* */
@@ -161,8 +169,9 @@ int nds_exit(void);
  * once for the initial filesystem set and again whenever more filesystems
  * become available. Concurrent nds_register_fs() calls are thread-safe.
  *
- * nds_unregister_fs() is currently a no-op placeholder; registered
- * topologies remain active until nds_exit() closes the topology device fd.
+ * nds_unregister_fs() removes the topology identified by each descriptor
+ * from NDS's topology fd. A topology remains active if another registration
+ * still pins the same top device.
  */
 int nds_register_fs(const struct nds_fs_desc *desc);
 int nds_unregister_fs(const struct nds_fs_desc *desc);
@@ -191,8 +200,8 @@ int nds_io_destroy_ctx(struct nds_io_ctx *ctx);
  *
  * Each iocb is one logical I/O: its iov[] is scatter-gather on a single
  * obj.fd / offset and completes as one event (user_data). Different iocbs
- * may target different files; the library issues one IOCTL_RW_FILE per
- * iocb (no cross-iocb merge).
+ * may target different files; the library submits the valid prefix as
+ * independent IOCTL_SUBMIT_IO items without cross-iocb merging.
  *
  * Fail-stop like Linux io_submit: on a mid-batch failure return the count
  * of iocbs already accepted (positive); the failed iocb's errno is not

@@ -21,6 +21,7 @@ export XDS_GUEST_DEV_1=/dev/nvme0n1
 export XDS_GUEST_DEV_2=/dev/nvme0n2
 export XDS_RESULT_DIR=$WORK_DIR/results
 export XDS_SSH_CONFIG=/tmp/xds-ssh-config
+export XDS_BASIC_PROFILE=quick
 
 # shellcheck source=run_dual_kernel_matrix.sh
 source "$SCRIPT_DIR/run_dual_kernel_matrix.sh"
@@ -85,6 +86,24 @@ test_ssh_config_is_honored()
 		"$SCRIPT_DIR/run_dual_kernel_matrix.sh"
 }
 
+test_default_suite_selection()
+(
+    boot_kernel() { :; }
+    prepare_guest() { :; }
+    save_kernel_identity() { :; }
+    download_guest_artifacts() { :; }
+    run_suite() { printf '%s\n' "$*"; }
+
+    local actual expected
+    actual=$(run_variant nokasan)
+    expected=$(printf '%s\n' \
+        'nokasan basic basic_test.sh XDS_BASIC_PROFILE=quick' \
+        "nokasan stress-raid0 stress_test.sh XDS_STRESS_MODE=raid0 XDS_STRESS_ITERATIONS=16" \
+        "nokasan cq-check-raid0 cq_check_test.sh XDS_STRESS_MODE=raid0")
+    [[ $actual == "$expected" ]]
+)
+
+test_default_suite_selection
 test_copy_artifacts
 test_copy_collision
 test_suite_failure_propagation

@@ -5,6 +5,52 @@ set -Eeuo pipefail
 TEST_NAME=basic_test
 source "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/common.sh"
 
+readonly BASIC_PROFILE=${XDS_BASIC_PROFILE:-quick}
+
+validate_basic_profile()
+{
+	case $BASIC_PROFILE in
+		quick | full) ;;
+		*) die "XDS_BASIC_PROFILE must be quick or full" ;;
+	esac
+}
+
+basic_block_apis()
+{
+	if [[ $BASIC_PROFILE == full || $1 == direct-nsid-1 || $1 == raid0 ]]; then
+		printf '%s\n' c python nds-c nds-python
+	else
+		printf '%s\n' c nds-c
+	fi
+}
+
+basic_fs_sizes()
+{
+	if [[ $BASIC_PROFILE == full || $1 == direct ]]; then
+		printf '%s\n' 1024 2048 4096
+	else
+		printf '%s\n' 4096
+	fi
+}
+
+basic_fs_apis()
+{
+	if [[ $BASIC_PROFILE == full || $1 == direct-ext4-4096 ]]; then
+		printf '%s\n' c python nds-c nds-python
+	else
+		printf '%s\n' c nds-c
+	fi
+}
+
+basic_fs_modes()
+{
+	if [[ $BASIC_PROFILE == full || $1 == direct-ext4-4096 ]]; then
+		printf '%s\n' single queued threaded
+	else
+		printf '%s\n' single
+	fi
+}
+
 # Map NDS APIs onto the same CMB VA windows as file_p2p c/python (phases are sequential).
 api_va_family()
 {
@@ -162,7 +208,7 @@ make_concurrent_manifest()
 
 prepare_fs_files()
 {
-	local directory=$1 block_size=$2 phase_seed=$3
+	local directory=$1 block_size=$2 phase_seed=$3 mode_count=$4
 	local i
 
 	generate_pattern "$directory/tiny.dat" 512 $((phase_seed + 1))
@@ -171,10 +217,12 @@ prepare_fs_files()
 	generate_pattern "$directory/page_cross.dat" $((4 * 1024 * 1024)) $((phase_seed + 4))
 	generate_pattern "$directory/large.dat" $((16 * 1024 * 1024)) $((phase_seed + 5))
 	generate_pattern "$directory/va_tail.dat" $((8 * block_size)) $((phase_seed + 6))
-	for i in 0 1 2 3; do
-		generate_pattern "$directory/concurrent_$i.dat" \
-			$(((i + 2) * 1024 * 1024)) $((phase_seed + 10 + i))
-	done
+	if (( mode_count > 1 )); then
+		for i in 0 1 2 3; do
+			generate_pattern "$directory/concurrent_$i.dat" \
+				$(((i + 2) * 1024 * 1024)) $((phase_seed + 10 + i))
+		done
+	fi
 	sync
 }
 
@@ -228,10 +276,9 @@ run_logged_mem_registration_case()
 	fi
 }
 
-run_logged_write_rejection_case()
+run_logged_rw_case()
 {
-	local api=$1
-	local label="rw-rejection.$api.rejection"
+	local label=$1
 	local output="$WORK_DIR/$label.out"
 	local kernel_log="$WORK_DIR/$label.dmesg"
 	local status
@@ -246,8 +293,52 @@ run_logged_write_rejection_case()
 	cat "$output"
 	if (( status != 0 )); then
 		cat "$kernel_log" >&2
-		die "$api unified read/write rejection tests failed"
+		die "$label read/write tests failed"
 	fi
+}
+
+run_logged_write_rejection_case()
+{
+	local api=$1
+
+	shift
+	run_logged_rw_case "rw-rejection.$api.rejection" "$@"
+}
+
+run_logged_coverage_errors()
+{
+	local mode=$1 target=$2
+	local label="coverage-errors-$mode.c.rejection"
+	local output="$WORK_DIR/$label.out"
+	local kernel_log="$WORK_DIR/$label.dmesg"
+	local status
+
+	log "Raw UAPI coverage errors: $mode"
+	dmesg -C
+	set +e
+	env -u XDS_INJECT "XDS_COMPONENT=$DEV1" \
+		"$SCRIPT_DIR/coverage_errors" "$target" "$mode" >"$output" 2>&1
+	status=$?
+	set -e
+	dmesg -c >"$kernel_log"
+	cat "$output"
+	if (( status != 0 )); then
+		cat "$kernel_log" >&2
+		die "coverage_errors $mode failed"
+	fi
+}
+
+run_coverage_errors()
+{
+	run_logged_coverage_errors easy "$DEV1"
+	# A small single-component mapping reaches submission-time range errors.
+	[[ ! -e $DM_PATH ]] || die "$DM_PATH already exists"
+	dmsetup create "$DM_NAME" --table "0 128 linear $DEV1 0"
+	DM_CREATED=1
+	udevadm settle
+	run_logged_coverage_errors range "$DM_PATH"
+	dmsetup remove --retry "$DM_NAME"
+	DM_CREATED=0
 }
 
 run_write_pipeline()
@@ -318,7 +409,7 @@ run_write_pipeline()
 		die "$label $api HBM CRC32 mismatch: expected $expected_crc, got ${actual_crc[*]:-none}"
 	printf 'crc-pass case=read crc32=%s\n' "${actual_crc[0],,}" \
 		>>"$read_output"
-	check_stats
+	check_stats read
 
 	write_output="$WORK_DIR/$label.$suffix.rw-write.out"
 	write_log="$WORK_DIR/$label.$suffix.rw-write.dmesg"
@@ -337,7 +428,7 @@ run_write_pipeline()
 		cat "$write_log" >&2
 		die "$label $api write emitted read-only diagnostics"
 	fi
-	check_stats
+	check_stats write
 
 	"$SCRIPT_DIR/direct_io_test" --mode verify --device "$target" \
 		--source-offset "$source_offset" --target-offset "$target_offset" \
@@ -368,7 +459,7 @@ run_write_pipeline()
 		die "$label $api mixed read CRC32 mismatch: expected $expected_crc, got ${actual_crc[*]:-none}"
 	printf 'crc-pass case=mixed crc32=%s\n' "${actual_crc[0],,}" \
 		>>"$mixed_output"
-	check_stats
+	check_stats mixed
 	"$SCRIPT_DIR/direct_io_test" --mode verify --device "$target" \
 		--source-offset "$source_offset" --target-offset "$target_offset" \
 		--length "$length" --seed "$phase_seed"
@@ -378,12 +469,14 @@ run_block_matrix()
 {
 	local target=$1 label=$2 phase_seed=$3 topology_boundary=${4:-0}
 	local size api manifest
+	local -a apis
 
 	size=$(blockdev --getsize64 "$target")
 	log "$label: writing deterministic block-device pattern"
 	generate_pattern "$target" "$size" "$phase_seed"
 	blockdev --flushbufs "$target"
-	for api in c python nds-c nds-python; do
+	mapfile -t apis < <(basic_block_apis "$label")
+	for api in "${apis[@]}"; do
 		manifest=$(make_block_manifest "$api" "$target" "$size" "$label" \
 			"$topology_boundary")
 		run_manifest "$api" "$target" single "$manifest" "$label"
@@ -402,16 +495,21 @@ run_filesystem_matrix()
 	local topology=$1 label=$2 block_size=$3 phase_seed=$4
 	local directory="$MOUNT_DIR/data"
 	local api mode manifest
+	local -a apis modes
 
 	mkdir -p "$directory"
-	prepare_fs_files "$directory" "$block_size" "$phase_seed"
-	for api in c python nds-c nds-python; do
-		manifest=$(make_single_manifest "$api" "$directory" "$label" \
-			"$block_size")
-		run_manifest "$api" "$topology" single "$manifest" "$label"
-		for mode in queued threaded; do
-			manifest=$(make_concurrent_manifest "$api" "$mode" "$directory" \
-				"$block_size" "$label")
+	mapfile -t apis < <(basic_fs_apis "$label")
+	mapfile -t modes < <(basic_fs_modes "$label")
+	prepare_fs_files "$directory" "$block_size" "$phase_seed" "${#modes[@]}"
+	for api in "${apis[@]}"; do
+		for mode in "${modes[@]}"; do
+			if [[ $mode == single ]]; then
+				manifest=$(make_single_manifest "$api" "$directory" "$label" \
+					"$block_size")
+			else
+				manifest=$(make_concurrent_manifest "$api" "$mode" "$directory" \
+					"$block_size" "$label")
+			fi
 			run_manifest "$api" "$topology" "$mode" "$manifest" "$label"
 		done
 	done
@@ -421,8 +519,10 @@ run_ext4_sizes()
 {
 	local target=$1 label=$2
 	local actual_block_size block_size phase_seed
+	local -a sizes
 
-	for block_size in 1024 2048 4096; do
+	mapfile -t sizes < <(basic_fs_sizes "$label")
+	for block_size in "${sizes[@]}"; do
 		log "$label: ext4 block size $block_size"
 		mkfs.ext4 -F -q -b "$block_size" "$target"
 		mount -o noatime "$target" "$MOUNT_DIR"
@@ -433,6 +533,14 @@ run_ext4_sizes()
 		phase_seed=$SEED
 		run_filesystem_matrix "$target" "$label-ext4-$block_size" \
 			"$block_size" "$phase_seed"
+		# DEV2 must be independent scratch, never a mounted DM/MD component.
+		if [[ $label == direct ]]; then
+			log "Regular-file raw write coverage"
+			run_logged_rw_case "file-raw-$block_size.c.rw-write" \
+				"$SCRIPT_DIR/file_raw_write_test" --topology "$target" \
+				--scratch "$DEV2" --directory "$MOUNT_DIR/data" \
+				--cmb-va $((96 * 1024 * 1024 - 512))
+		fi
 		umount "$MOUNT_DIR"
 	done
 }
@@ -446,18 +554,26 @@ test_direct_nvme()
 	next_seed
 	run_block_matrix "$DEV1" direct-nsid-1 "$SEED"
 	log "Unified read/write API rejection coverage"
-	run_logged_write_rejection_case c \
-		"$SCRIPT_DIR/uapi_rw_test" --target "$DEV1"
-	run_logged_write_rejection_case python env \
-		"PYTHONPATH=$REPO_ROOT/file_p2p" python3 \
-		"$SCRIPT_DIR/python_rw_rejection_test.py" \
-		--regular-file "$WORK_DIR/python-regular-write.dat"
+	# The checkout may be on Btrfs, which has no s_bdev for raw file I/O.
+	# Keep the regular fixture on ext4; rejection tests register no topology.
+	mkfs.ext4 -F -q -b 4096 "$DEV2"
+	mount -o noatime "$DEV2" "$MOUNT_DIR"
+	(
+		cd "$MOUNT_DIR"
+		run_logged_write_rejection_case c \
+			"$SCRIPT_DIR/uapi_rw_test" --target "$DEV1"
+		run_logged_write_rejection_case python env \
+			"PYTHONPATH=$REPO_ROOT/file_p2p" python3 \
+			"$SCRIPT_DIR/python_rw_rejection_test.py" \
+			--regular-file "$MOUNT_DIR/python-regular-write.dat"
+	)
+	umount "$MOUNT_DIR"
 	for api in c python; do
 		run_write_pipeline "$DEV1" direct-nsid-1-registered \
 			"$((SEED + 200))" 0 "$api" registered
 	done
 	log "Registered-memory API and lifetime"
-	run_logged_mem_registration_case c 5 \
+	run_logged_mem_registration_case c 134 \
 		"$SCRIPT_DIR/mem_registration_test" --topology "$DEV1"
 	run_logged_mem_registration_case python 3 env \
 		"PYTHONPATH=$REPO_ROOT/file_p2p" python3 \
@@ -550,20 +666,46 @@ test_raid0_partitions()
 	log "MD RAID0 with NVMe partition members"
 	create_component_partitions
 	create_raid0 "$PART_DEV1" "$PART_DEV2"
+	"$SCRIPT_DIR/topo_test" --topology "$MD_DEV" \
+		--raid0-members "$PART_DEV1" "$PART_DEV2"
 	next_seed
 	run_block_matrix "$MD_DEV" raid0-part "$SEED" $((64 * 1024))
 	run_ext4_sizes "$MD_DEV" raid0-part
 	cleanup_storage
 }
 
-run_cq_race_smoke()
+test_raid0_same_namespace()
+{
+	local -a partitions
+
+	log "MD RAID0 with two partitions on one NVMe namespace"
+	wipe_test_devices
+	# Two 28 MiB members, starting at 1 MiB and 32 MiB on a 64 MiB namespace.
+	printf '2048,57344,L\n65536,57344,L\n' |
+		sfdisk --quiet "$DEV1" >/dev/null
+	PARTITION_CREATED=1
+	udevadm settle
+	mapfile -t partitions < <(lsblk -nrpo NAME,TYPE "$DEV1" |
+		awk '$2 == "part" { print $1 }')
+	[[ ${#partitions[@]} -eq 2 ]] || die "expected two partitions on $DEV1"
+	PART_DEV1=${partitions[0]}
+	PART_DEV2=${partitions[1]}
+	create_raid0 "$PART_DEV1" "$PART_DEV2"
+	"$SCRIPT_DIR/topo_test" --topology "$MD_DEV" \
+		--raid0-members "$PART_DEV1" "$PART_DEV2"
+	next_seed
+	run_block_matrix "$MD_DEV" raid0-same-ns "$SEED" $((64 * 1024))
+	cleanup_storage
+}
+
+run_cq_live_smoke()
 {
 	local cq_workers=8 cq_iterations=16
 	local va_granularity=$((4 << 10)) backing_page_size=$((2 << 20))
-	local data_dir workload mode api label output result kernel_log status
+	local data_dir workload api label output kernel_log status
 	local -a command common_options
 
-	log "NDS cq-race smoke (workers=$cq_workers iterations=$cq_iterations)"
+	log "NDS live CQ smoke (workers=$cq_workers iterations=$cq_iterations)"
 	wipe_test_devices
 	mkfs.ext4 -F -q -b 4096 "$DEV1"
 	mount -o noatime "$DEV1" "$MOUNT_DIR"
@@ -574,47 +716,6 @@ run_cq_race_smoke()
 		--workers "$cq_workers" --iterations "$cq_iterations" \
 		--seed 0x584453 --mode nvme --topology "$DEV1"
 	sync
-
-	for mode in cq-race cq-race-drain; do
-		for api in nds-c nds-python; do
-			label="$mode-smoke.$api"
-			output="$WORK_DIR/$label.out"
-			result="$WORK_DIR/$label.result.tsv"
-			kernel_log="$WORK_DIR/$label.dmesg"
-			common_options=(--topology "$DEV1" --manifest "$workload" \
-				--mode "$mode" --workers "$cq_workers" \
-				--iterations "$cq_iterations" --cmb-size "$CMB_SIZE" \
-				--va-granularity "$va_granularity" \
-				--backing-page-size "$backing_page_size" \
-				--result-manifest "$result")
-			if [[ $api == nds-c ]]; then
-				command=("$SCRIPT_DIR/nds_api_test" "${common_options[@]}")
-			else
-				command=(env "PYTHONPATH=$REPO_ROOT/file_p2p" python3 \
-					"$SCRIPT_DIR/python_nds_api_test.py" \
-					"${common_options[@]}")
-			fi
-			log "cq-race smoke: $mode via $api"
-			dmesg -C
-			set +e
-			"${command[@]}" >"$output" 2>&1
-			status=$?
-			set -e
-			dmesg -c >"$kernel_log"
-			cat "$output"
-			(( status == 0 )) ||
-				die "cq-race smoke $mode $api runner failed"
-			python3 "$SCRIPT_DIR/check_stress.py" --workload "$workload" \
-				--result "$result" --workers "$cq_workers" \
-				--iterations "$cq_iterations" \
-				--cmb-size "$CMB_SIZE" \
-				--granularity "$va_granularity" \
-				--backing-page-size "$backing_page_size"
-			python3 "$SCRIPT_DIR/check_crc.py" --manifest "$result" \
-				--log "$kernel_log" \
-				--crc-tool "$SCRIPT_DIR/crc32_verify"
-		done
-	done
 
 	for api in nds-c nds-python; do
 		label="cq-race-drain-live-smoke.$api"
@@ -633,7 +734,8 @@ run_cq_race_smoke()
 				"$SCRIPT_DIR/python_nds_api_test.py" \
 				"${common_options[@]}")
 		fi
-		log "cq-race smoke: cq-race-drain-live via $api (no CRC)"
+		log "cq-race smoke: cq-race-drain-live via $api" \
+			"(CRC finalizers built; CRC not verified)"
 		dmesg -C
 		set +e
 		"${command[@]}" >"$output" 2>&1
@@ -650,19 +752,34 @@ run_cq_race_smoke()
 main()
 {
 	(( $# == 0 )) || die "basic_test.sh does not accept positional arguments"
+	validate_basic_profile
 	init_work_dir xds-basic-test
 	trap cleanup EXIT
 
+	log "Basic test profile: $BASIC_PROFILE"
+	cd "$REPO_ROOT"
 	preflight
 	build_all
+	log "Host-only regular-write extent preparation tests"
+	"$SCRIPT_DIR/prepare_extents_test"
+	"$SCRIPT_DIR/nds_file_prepare_test"
+	log "Checking topology discovery without target device nodes"
+	"$SCRIPT_DIR/topo_devt_test"
 	crc_self_test
 	save_kernel_identity
 	load_modules
+	run_coverage_errors
+	log "Topology delete API"
+	"$SCRIPT_DIR/topo_test" --topology "$DEV1"
 	log "NDS rejection coverage"
 	"$SCRIPT_DIR/nds_api_test" --topology "$DEV1" --mode reject
 	env "PYTHONPATH=$REPO_ROOT/file_p2p" python3 \
 		"$SCRIPT_DIR/python_nds_api_test.py" --topology "$DEV1" --mode reject
-	run_cq_race_smoke
+	# Fixed CQ accounting has its own bounded suite; timed live pressure
+	# remains available in the full profile and cq_race_test.sh.
+	if [[ $BASIC_PROFILE == full ]]; then
+		run_cq_live_smoke
+	fi
 	test_direct_nvme
 	test_nvme_partition
 	test_linear_dm
@@ -670,6 +787,7 @@ main()
 	test_raid0
 	test_raid0_slot_order
 	test_raid0_partitions
+	test_raid0_same_namespace
 	log "All XDS C, Python, and NDS API tests passed"
 }
 

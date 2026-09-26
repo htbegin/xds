@@ -20,6 +20,37 @@ sys.modules[SPEC.name] = REPORT
 SPEC.loader.exec_module(REPORT)
 
 
+REJECTION_CASES = {
+    "c": (
+        ("unknown operation", -22),
+        ("unknown flags", -95),
+        ("regular file write without topology", -19),
+        ("read-only regular fd", -9),
+        ("read-only block fd", -9),
+        ("shared write extent", -95),
+        ("delalloc write extent", -95),
+        ("block multi-extent write without topo", -19),
+        ("block second extent capacity", -27),
+        ("regular logical gap", -22),
+        ("regular multi-extent write without topo", -19),
+        ("regular second extent capacity", -27),
+        ("rejection-left-no-event", 0),
+        ("insufficient extent coverage", -7),
+        ("out-of-capacity range", -27),
+        ("batch invalid first", -22),
+        ("batch-reject-left-no-event", 0),
+        ("userspace unknown operation", -22),
+        ("userspace regular file write", -9),
+    ),
+    "python": (
+        ("unknown operation", -22),
+        ("regular file write", -9),
+        ("negative host pid", -22),
+        ("registered host pid", -22),
+    ),
+}
+
+
 def write_identity(directory: Path, variant: str) -> None:
     kasan = variant == "kasan"
     config = "CONFIG_KASAN=y" if kasan else "# CONFIG_KASAN is not set"
@@ -48,6 +79,21 @@ def stress_output(api: str) -> str:
             lines.append(
                 f"crc-pass case={case_id} crc32=0x{crc:08x}"
             )
+    return "\n".join(lines) + "\n"
+
+
+def cq_check_output(mode: str, api: str) -> str:
+    lines = [
+        f"api={api} case=stress-i{iteration:04d}-w{worker:02d} ret=0 expected=0"
+        for iteration in range(REPORT.CQ_CHECK_ITERATIONS)
+        for worker in range(REPORT.CQ_CHECK_WORKERS)
+    ]
+    count = REPORT.CQ_CHECK_ITERATIONS * REPORT.CQ_CHECK_WORKERS
+    lines.append(
+        f"cq-race summary: submitted={count} completed={count} expected={count} "
+        f"with_drain={int(mode == 'cq-race-drain')} live_submit_drain=0 drain_overlap_ms=0"
+    )
+    lines.append(f"stress-check-pass operations={count} total_file_size=8388608")
     return "\n".join(lines) + "\n"
 
 
@@ -87,22 +133,7 @@ def create_complete_fixture(base: Path) -> None:
                     (directory / f"{label}.dmesg").write_text(
                         "", encoding="utf-8"
                     )
-        rejection_cases = {
-            "c": (
-                ("unknown operation", -22),
-                ("unknown flags", -95),
-                ("regular file write", -95),
-                ("read-only block fd", -9),
-                ("insufficient extent coverage", -7),
-                ("out-of-capacity range", -27),
-                ("userspace unknown operation", -22),
-                ("userspace regular file write", -95),
-            ),
-            "python": (
-                ("unknown operation", -22),
-                ("regular file write", -95),
-            ),
-        }
+        rejection_cases = REJECTION_CASES
         for api, cases in rejection_cases.items():
             label = f"rw-rejection.{api}.rejection"
             output = "".join(
@@ -128,6 +159,12 @@ def create_complete_fixture(base: Path) -> None:
                     (directory / f"{label}.dmesg").write_text(
                         "", encoding="utf-8"
                     )
+        for label in REPORT.expected_cq_check_labels():
+            _, mode, api, _ = label.split(".")
+            (directory / f"{label}.out").write_text(
+                cq_check_output(mode, api), encoding="utf-8"
+            )
+            (directory / f"{label}.dmesg").write_text("", encoding="utf-8")
 
 
 class ReportTest(unittest.TestCase):
@@ -158,12 +195,17 @@ class ReportTest(unittest.TestCase):
             )
             self.assertEqual(result.returncode, 0, result.stderr)
             report = json.loads(json_path.read_text(encoding="utf-8"))
+            rejection_count = sum(
+                len(cases) for cases in REJECTION_CASES.values()
+            )
             expected_per_kernel = (
                 1
                 + len(REPORT.STRESS_APIS)
                 * len(REPORT.STRESS_MEMORY_MODES)
                 * 3
-                + 10
+                + rejection_count
+                + len(REPORT.expected_cq_check_labels())
+                * REPORT.CQ_CHECK_WORKERS * REPORT.CQ_CHECK_ITERATIONS
                 + len(REPORT.expected_stress_labels())
                 * REPORT.STRESS_ITERATIONS
                 * REPORT.STRESS_WORKERS
@@ -210,8 +252,79 @@ class ReportTest(unittest.TestCase):
                 all(row["io_mode"] == "single" for row in basic_rows)
             )
             markdown = markdown_path.read_text(encoding="utf-8")
-            self.assertIn("## kasan/stress-dm.c.normal", markdown)
+            self.assertIn("## kasan/stress-raid0.c.normal", markdown)
             self.assertIn("stress-i0015-w15", markdown)
+
+    def test_stress_matrix_selection(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            create_complete_fixture(base)
+            self.assertEqual(REPORT.build_report(base).validation_errors, [])
+            for variant in REPORT.EXPECTED_VARIANTS:
+                directory = base / variant
+                for topology in ("dm", "nvme"):
+                    for api in REPORT.STRESS_APIS:
+                        for memory_mode in REPORT.STRESS_MEMORY_MODES:
+                            label = f"stress-{topology}.{api}.{memory_mode}"
+                            (directory / f"{label}.out").write_text(
+                                stress_output(api), encoding="utf-8"
+                            )
+                            (directory / f"{label}.dmesg").write_text(
+                                "", encoding="utf-8"
+                            )
+            self.assertEqual(REPORT.build_report(base).validation_errors, [])
+            # Archived full matrices need no new bounded CQ artifacts.
+            for variant in REPORT.EXPECTED_VARIANTS:
+                for path in (base / variant).glob("cq-check-*"):
+                    path.unlink()
+            self.assertEqual(REPORT.build_report(base).validation_errors, [])
+            (base / "kasan/stress-dm.c.normal.out").unlink()
+            self.assertTrue(any(
+                "stress suites differ" in error
+                for error in REPORT.build_report(base).validation_errors
+            ))
+
+    def test_missing_required_stress_suite(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            create_complete_fixture(base)
+            (base / "kasan/stress-raid0.nds-c.registered.out").unlink()
+            self.assertTrue(any(
+                "stress suites differ" in error
+                for error in REPORT.build_report(base).validation_errors
+            ))
+
+    def test_cq_checks_reject_incomplete_results(self) -> None:
+        label = "cq-check-raid0.cq-race.nds-c.registered"
+        mutations = {
+            "missing suite": None,
+            "missing case": lambda text: text.split("\n", 1)[1],
+            "missing manifest validation": lambda text: text.replace(
+                "stress-check-pass", "not-checked"
+            ),
+            "lost completion": lambda text: text.replace("completed=128", "completed=127"),
+        }
+        for name, mutate in mutations.items():
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as temporary:
+                base = Path(temporary)
+                create_complete_fixture(base)
+                for variant in REPORT.EXPECTED_VARIANTS:
+                    path = base / variant / f"{label}.out"
+                    if mutate is None:
+                        path.unlink()
+                    else:
+                        path.write_text(mutate(path.read_text()), encoding="utf-8")
+                self.assertTrue(REPORT.build_report(base).validation_errors)
+
+    def test_cq_drain_can_consume_completions(self) -> None:
+        text = cq_check_output("cq-race-drain", "nds-c")
+        text = text.replace("completed=128", "completed=127")
+        self.assertEqual(REPORT.validate_cq_check_output(
+            "cq-check-raid0.cq-race-drain.nds-c.normal", text,
+        ), [])
+        self.assertEqual(REPORT.suite_dimensions(
+            "cq-check-raid0.cq-race-drain.nds-c.registered",
+        ), ("cq-check-raid0", "nds-c", "registered", "cq-race-drain"))
 
     def test_duplicate_case_lines_are_not_dropped(self) -> None:
         cases = REPORT.parse_cases(

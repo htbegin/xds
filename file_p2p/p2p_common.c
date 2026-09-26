@@ -1,3 +1,6 @@
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -24,11 +27,6 @@
 #define P2P_SECTORS_PER_KB (1024U / P2P_SECTOR_SIZE)
 #define P2P_DM_CONTROL "/dev/mapper/control"
 #define P2P_DM_BUFFER_SIZE (16U << 10)
-#define P2P_UNSUPPORTED_FIEMAP_FLAGS \
-	(FIEMAP_EXTENT_UNKNOWN | FIEMAP_EXTENT_DELALLOC | \
-	 FIEMAP_EXTENT_ENCODED | FIEMAP_EXTENT_DATA_ENCRYPTED | \
-	 FIEMAP_EXTENT_NOT_ALIGNED | FIEMAP_EXTENT_DATA_INLINE | \
-	 FIEMAP_EXTENT_DATA_TAIL | FIEMAP_EXTENT_UNWRITTEN)
 
 struct raid0_member {
 	int slot;
@@ -170,34 +168,25 @@ static int validate_nvme_component_input(dev_t devt)
 	return validate_nvme_component(whole_dev);
 }
 
-static int get_block_size_sectors(const char *dev, uint64_t *size_sectors)
+static int get_block_size_sectors(dev_t dev_id, uint64_t *size_sectors)
 {
-	uint64_t size_bytes;
-	int fd;
+	unsigned long long size;
 	int err;
 
-	fd = open(dev, O_RDONLY | O_CLOEXEC);
-	if (fd < 0)
-		return -errno;
-	if (ioctl(fd, BLKGETSIZE64, &size_bytes) < 0)
-		err = -errno;
-	else
-		err = 0;
-	close(fd);
+	err = read_sysfs_u64(dev_id, "size", &size);
 	if (err)
 		return err;
-	if (!size_bytes || size_bytes % P2P_SECTOR_SIZE) {
-		fprintf(stderr, "invalid block-device size %llu for %s\n",
-			(unsigned long long)size_bytes, dev);
+	if (!size) {
+		fprintf(stderr, "invalid block-device size for %u:%u\n",
+			major(dev_id), minor(dev_id));
 		return -EINVAL;
 	}
 
-	*size_sectors = size_bytes / P2P_SECTOR_SIZE;
+	*size_sectors = size;
 	return 0;
 }
 
-static int discover_nvme(const char *dev, dev_t top_dev,
-			 struct topo_user_cfg *cfg)
+static int discover_nvme(dev_t top_dev, struct topo_user_cfg *cfg)
 {
 	uint64_t size_sectors = 0;
 	int err;
@@ -205,7 +194,7 @@ static int discover_nvme(const char *dev, dev_t top_dev,
 	err = validate_nvme_component_input(top_dev);
 	if (err)
 		return err;
-	err = get_block_size_sectors(dev, &size_sectors);
+	err = get_block_size_sectors(top_dev, &size_sectors);
 	if (err)
 		return err;
 
@@ -291,8 +280,7 @@ out:
 	return err;
 }
 
-static int discover_linear(const char *dev, dev_t top_dev,
-			   struct topo_user_cfg *cfg)
+static int discover_linear(dev_t top_dev, struct topo_user_cfg *cfg)
 {
 	struct dm_target_spec *first;
 	struct dm_target_spec *spec;
@@ -305,8 +293,9 @@ static int discover_linear(const char *dev, dev_t top_dev,
 
 	err = dm_table_query(top_dev, &buffer);
 	if (err) {
-		fprintf(stderr, "discover linear topology for %s failed: %d\n",
-			dev, err);
+		fprintf(stderr,
+			"discover linear topology for %u:%u failed: %d\n",
+			major(top_dev), minor(top_dev), err);
 		return err;
 	}
 	dmi = buffer;
@@ -546,8 +535,7 @@ out:
 	return err;
 }
 
-static int discover_raid0(const char *dev, dev_t top_dev,
-			  struct topo_user_cfg *cfg)
+static int discover_raid0(dev_t top_dev, struct topo_user_cfg *cfg)
 {
 	unsigned long long chunk_bytes;
 	unsigned long long chunk_sectors;
@@ -561,7 +549,8 @@ static int discover_raid0(const char *dev, dev_t top_dev,
 		return err;
 	level[strcspn(level, "\r\n")] = '\0';
 	if (strcmp(level, "raid0")) {
-		fprintf(stderr, "%s uses unsupported MD level %s\n", dev, level);
+		fprintf(stderr, "%u:%u uses unsupported MD level %s\n",
+			major(top_dev), minor(top_dev), level);
 		return -EOPNOTSUPP;
 	}
 	err = read_sysfs_u64(top_dev, "md/chunk_size", &chunk_bytes);
@@ -588,8 +577,9 @@ static int discover_raid0(const char *dev, dev_t top_dev,
 	cfg->top_dev = top_dev;
 	err = discover_raid0_members(top_dev, raid_disks, cfg);
 	if (err)
-		fprintf(stderr, "discover RAID0 members for %s failed: %d\n",
-			dev, err);
+		fprintf(stderr,
+			"discover RAID0 members for %u:%u failed: %d\n",
+			major(top_dev), minor(top_dev), err);
 	return err;
 }
 
@@ -612,24 +602,19 @@ static void print_topo_cfg(const struct topo_user_cfg *cfg)
 	}
 }
 
-int p2p_add_topo(int dev_fd, const char *dev)
+int p2p_add_topo(int dev_fd, dev_t dev_id)
 {
 	struct topo_user_cfg *cfg = NULL;
-	struct stat st;
 	size_t cfg_size;
-	int (*discover)(const char *, dev_t, struct topo_user_cfg *);
+	int (*discover)(dev_t, struct topo_user_cfg *);
 	int err;
 
-	if (stat(dev, &st) < 0)
-		return -errno;
-	if (!S_ISBLK(st.st_mode))
-		return -EINVAL;
-	if (path_exists(st.st_rdev, "partition") ||
-	    path_exists(st.st_rdev, "device/subsysnqn"))
+	if (path_exists(dev_id, "partition") ||
+	    path_exists(dev_id, "device/subsysnqn"))
 		discover = discover_nvme;
-	else if (path_exists(st.st_rdev, "dm"))
+	else if (path_exists(dev_id, "dm"))
 		discover = discover_linear;
-	else if (path_exists(st.st_rdev, "md"))
+	else if (path_exists(dev_id, "md"))
 		discover = discover_raid0;
 	else
 		return -EOPNOTSUPP;
@@ -641,20 +626,48 @@ int p2p_add_topo(int dev_fd, const char *dev)
 		err = -ENOMEM;
 		goto out;
 	}
-	err = discover(dev, st.st_rdev, cfg);
+	err = discover(dev_id, cfg);
 	if (err)
 		goto out;
 	print_topo_cfg(cfg);
 	if (ioctl(dev_fd, IOCTL_ADD_TOPO, cfg) < 0) {
 		err = -errno;
-		fprintf(stderr, "add topology for %s failed, errno: %d\n",
-			dev, err);
+		fprintf(stderr, "add topology for %u:%u failed, errno: %d\n",
+			major(dev_id), minor(dev_id), err);
 	} else {
 		err = 0;
 	}
 out:
 	free(cfg);
 	return err;
+}
+
+int p2p_del_topo(int dev_fd, dev_t dev_id)
+{
+	struct topo_del_cfg param = {
+		.top_dev = dev_id,
+		.reserved = 0,
+	};
+
+	if (ioctl(dev_fd, IOCTL_DEL_TOPO, &param) < 0)
+		return -errno;
+	return 0;
+}
+
+int p2p_del_topo_fd(int dev_fd, int topo_fd)
+{
+	struct stat st;
+	dev_t top_dev;
+
+	if (fstat(topo_fd, &st) < 0)
+		return -errno;
+	if (S_ISBLK(st.st_mode))
+		top_dev = st.st_rdev;
+	else if (S_ISREG(st.st_mode))
+		top_dev = st.st_dev;
+	else
+		return -EINVAL;
+	return p2p_del_topo(dev_fd, top_dev);
 }
 
 static unsigned long long align_down_u64(unsigned long long value,
@@ -688,8 +701,7 @@ static int calc_fiemap_extent_count(unsigned long offset, unsigned long size,
 
 static struct fiemap *alloc_fiemap(unsigned int extent_count)
 {
-	return calloc(1, sizeof(struct fiemap) +
-		      extent_count * sizeof(struct fiemap_extent));
+	return calloc(1, sizeof(struct fiemap) + extent_count * sizeof(struct fiemap_extent));
 }
 
 static int is_sector_aligned(unsigned long long value)
@@ -697,10 +709,9 @@ static int is_sector_aligned(unsigned long long value)
 	return !(value & (P2P_SECTOR_SIZE - 1));
 }
 
-static int trim_fiemap_extents(struct fiemap_extent *extents,
-			       unsigned int ext_num, unsigned long offset,
-			       unsigned long size, unsigned int *trimmed_ext_num,
-			       unsigned long long *total_size)
+static int trim_fiemap_extents(struct fiemap_extent *extents, unsigned int ext_num, unsigned int op,
+			       unsigned long offset, unsigned long size,
+			       unsigned int *trimmed_ext_num, unsigned long long *total_size)
 {
 	unsigned long long request_start = offset;
 	unsigned long long request_end = request_start + size;
@@ -717,15 +728,14 @@ static int trim_fiemap_extents(struct fiemap_extent *extents,
 
 		if (extent_end <= request_start || extent_start >= request_end)
 			continue;
-		if (extent.fe_flags & P2P_UNSUPPORTED_FIEMAP_FLAGS) {
-			fprintf(stderr,
-				"unsupported FIEMAP extent flags 0x%x at extent %u\n",
+		if ((extent.fe_flags & ~P2P_FIEMAP_SUPPORTED_FLAGS) ||
+		    (op == P2P_IO_WRITE && (extent.fe_flags & FIEMAP_EXTENT_SHARED))) {
+			fprintf(stderr, "unsupported FIEMAP extent flags 0x%x at extent %u\n",
 				extent.fe_flags, i);
 			return -EOPNOTSUPP;
 		}
 
-		trim_start = extent_start > request_start ?
-			     extent_start : request_start;
+		trim_start = extent_start > request_start ? extent_start : request_start;
 		trim_end = extent_end < request_end ? extent_end : request_end;
 		if (trim_end <= trim_start)
 			continue;
@@ -742,10 +752,9 @@ static int trim_fiemap_extents(struct fiemap_extent *extents,
 	return 0;
 }
 
-int p2p_prepare_io_extents(int file_fd, const struct stat *file_stat,
-			   unsigned long offset, unsigned long size,
-			   struct fiemap **exts_out, unsigned int *ext_num_out,
-			   unsigned long long *total_size_out)
+int p2p_prepare_io_extents(int file_fd, const struct stat *file_stat, unsigned int op,
+			   unsigned long offset, unsigned long size, struct fiemap **exts_out,
+			   unsigned int *ext_num_out, unsigned long long *total_size_out)
 {
 	struct fiemap *exts;
 	unsigned int block_size;
@@ -755,10 +764,13 @@ int p2p_prepare_io_extents(int file_fd, const struct stat *file_stat,
 	unsigned long long query_length;
 	int err;
 
-	if (S_ISBLK(file_stat->st_mode)) {
-		if (!is_sector_aligned(offset) || !is_sector_aligned(size))
-			return -EINVAL;
+	if (!size || !is_sector_aligned(offset) || !is_sector_aligned(size))
+		return -EINVAL;
+	/* File offsets are signed; reject overflow before changing the file. */
+	if (offset > INT64_MAX || size > INT64_MAX - offset)
+		return -EOVERFLOW;
 
+	if (S_ISBLK(file_stat->st_mode)) {
 		exts = alloc_fiemap(1);
 		if (!exts)
 			return -ENOMEM;
@@ -793,26 +805,41 @@ int p2p_prepare_io_extents(int file_fd, const struct stat *file_stat,
 	exts->fm_flags = 0;
 	exts->fm_extent_count = max_num;
 
+	if (op == P2P_IO_WRITE) {
+		if (fallocate(file_fd, 0, (off_t)offset, (off_t)size)) {
+			err = -errno;
+			fprintf(stderr, "fallocate fd %d offset %lu size %lu failed, errno: %d\n",
+				file_fd, offset, size, err);
+			goto free_exts;
+		}
+	}
+
 	err = ioctl(file_fd, FS_IOC_FIEMAP, exts);
 	if (err) {
 		err = -errno;
 		fprintf(stderr, "ioctl FS_IOC_FIEMAP failed, errno: %d\n", err);
-		free(exts);
-		return err;
+		goto free_exts;
+	}
+	if (exts->fm_mapped_extents > max_num) {
+		fprintf(stderr, "FIEMAP mapped extent count %u exceeds buffer capacity %u\n",
+			exts->fm_mapped_extents, max_num);
+		err = -EINVAL;
+		goto free_exts;
 	}
 
-	err = trim_fiemap_extents(exts->fm_extents, exts->fm_mapped_extents,
-				  offset, size, ext_num_out, total_size_out);
-	if (err) {
-		free(exts);
-		return err;
-	}
+	err = trim_fiemap_extents(exts->fm_extents, exts->fm_mapped_extents, op, offset, size,
+				  ext_num_out, total_size_out);
+	if (err)
+		goto free_exts;
 	*exts_out = exts;
 	return 0;
+
+free_exts:
+	free(exts);
+	return err;
 }
 
-int p2p_get_iov_size(const struct p2p_iov *iov, unsigned int iov_nr,
-		     unsigned long *size_out)
+int p2p_get_iov_size(const struct p2p_iov *iov, unsigned int iov_nr, unsigned long *size_out)
 {
 	unsigned long size = 0;
 	unsigned int i;
@@ -822,10 +849,8 @@ int p2p_get_iov_size(const struct p2p_iov *iov, unsigned int iov_nr,
 
 	for (i = 0; i < iov_nr; i++) {
 		if (!iov[i].size || iov[i].reserved ||
-		    ((iov[i].addr | iov[i].size) &
-		     (P2P_SECTOR_SIZE - 1)) ||
-		    UINT64_MAX - iov[i].addr < iov[i].size ||
-		    ULONG_MAX - size < iov[i].size)
+		    ((iov[i].addr | iov[i].size) & (P2P_SECTOR_SIZE - 1)) ||
+		    UINT64_MAX - iov[i].addr < iov[i].size || ULONG_MAX - size < iov[i].size)
 			return -EINVAL;
 		size += iov[i].size;
 	}

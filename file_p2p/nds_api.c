@@ -14,7 +14,6 @@
 #include <pthread.h>
 #include <sys/types.h>
 #include <sys/stat.h>
-#include <sys/sysmacros.h>
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/ioctl.h>
@@ -30,6 +29,8 @@
 
 _Static_assert(sizeof(struct nds_io_vec) == sizeof(struct p2p_iov),
 	       "nds_io_vec must match p2p_iov for zero-copy submission");
+_Static_assert(NDS_IO_MAX_IO_CNT <= P2P_MAX_IO_NR,
+	       "NDS submit size must fit the kernel batch ioctl");
 _Static_assert(_Alignof(struct nds_io_vec) == _Alignof(struct p2p_iov),
 	       "nds_io_vec alignment must match p2p_iov");
 _Static_assert(offsetof(struct nds_io_vec, buf_addr) ==
@@ -76,34 +77,18 @@ static int is_init(void)
 	return g_state.book_fd >= 0 && g_state.topo_fd >= 0;
 }
 
-static int topo_fd_to_bdev(int32_t topo_fd, char *bdev, size_t bdev_size)
+static int topo_fd_to_devt(int32_t topo_fd, dev_t *dev_id)
 {
-	char sys[64];
-	char link[PATH_MAX];
-	const char *base;
 	struct stat st;
-	dev_t target;
-	ssize_t n;
 
 	if (fstat(topo_fd, &st) < 0)
 		return -errno;
 	if (S_ISBLK(st.st_mode))
-		target = st.st_rdev;
+		*dev_id = st.st_rdev;
 	else if (S_ISREG(st.st_mode))
-		target = st.st_dev;
+		*dev_id = st.st_dev;
 	else
 		return -EINVAL;
-
-	snprintf(sys, sizeof(sys), "/sys/dev/block/%u:%u",
-		 major(target), minor(target));
-	n = readlink(sys, link, sizeof(link) - 1);
-	if (n < 0)
-		return -errno;
-	link[n] = '\0';
-	base = strrchr(link, '/');
-	base = base ? base + 1 : link;
-	if (snprintf(bdev, bdev_size, "/dev/%s", base) >= (int)bdev_size)
-		return -ENAMETOOLONG;
 	return 0;
 }
 
@@ -137,7 +122,7 @@ int nds_init(struct nds_init_param *param)
 
 int nds_register_fs(const struct nds_fs_desc *desc)
 {
-	char bdev[PATH_MAX];
+	dev_t dev_id = 0;
 	uint32_t i;
 	int ret;
 
@@ -146,9 +131,9 @@ int nds_register_fs(const struct nds_fs_desc *desc)
 
 	/* Register every supplied topology for the lifetime of topo_fd. */
 	for (i = 0; i < desc->fs_fd_cnt; i++) {
-		ret = topo_fd_to_bdev(desc->fs_fd[i], bdev, sizeof(bdev));
+		ret = topo_fd_to_devt(desc->fs_fd[i], &dev_id);
 		if (!ret)
-			ret = p2p_add_topo(g_state.topo_fd, bdev);
+			ret = p2p_add_topo(g_state.topo_fd, dev_id);
 		if (ret) {
 			fprintf(stderr, "nds: add topology for fd %d failed %d\n",
 				desc->fs_fd[i], ret);
@@ -160,7 +145,20 @@ int nds_register_fs(const struct nds_fs_desc *desc)
 
 int nds_unregister_fs(const struct nds_fs_desc *desc)
 {
-	(void)desc;
+	uint32_t i;
+	int ret;
+
+	if (!desc || !desc->fs_fd || !desc->fs_fd_cnt || desc->reserved)
+		return -EINVAL;
+
+	for (i = 0; i < desc->fs_fd_cnt; i++) {
+		ret = p2p_del_topo_fd(g_state.topo_fd, desc->fs_fd[i]);
+		if (ret) {
+			fprintf(stderr, "nds: delete topology for fd %d failed %d\n",
+				desc->fs_fd[i], ret);
+			return ret;
+		}
+	}
 	return 0;
 }
 
@@ -367,15 +365,14 @@ static int validate_nds_iov(const struct nds_io_cb *cb, unsigned long *io_size)
 	for (i = 0; i < cb->iov_cnt; i++) {
 		if (!cb->iov[i].buf_len || cb->iov[i].reserved)
 			return -EINVAL;
-		if (__builtin_add_overflow(size, (unsigned long)cb->iov[i].buf_len, &size))
-			return -EINVAL;
+		/* NDS_IO_MAX_IOV uint32_t lengths fit in a 64-bit unsigned long. */
+		size += cb->iov[i].buf_len;
 	}
 	*io_size = size;
 	return 0;
 }
 
-static int nds_iocb_to_io_param(const struct nds_io_cb *cb, int file_fd,
-				struct p2p_io_param *io,
+static int nds_iocb_to_io_param(const struct nds_io_cb *cb, int file_fd, struct p2p_io_param *io,
 				struct fiemap **exts_out)
 {
 	struct fiemap *exts = NULL;
@@ -392,8 +389,7 @@ static int nds_iocb_to_io_param(const struct nds_io_cb *cb, int file_fd,
 	err = validate_nds_iov(cb, &io_size);
 	if (err)
 		return err;
-	if (cb->offset > ULONG_MAX ||
-	    io_size > ULONG_MAX - (unsigned long)cb->offset)
+	if (cb->offset > ULONG_MAX || io_size > ULONG_MAX - (unsigned long)cb->offset)
 		return -EOVERFLOW;
 
 	if (cb->rw_flags & NDS_IO_F_REGISTERED_MEM) {
@@ -408,20 +404,19 @@ static int nds_iocb_to_io_param(const struct nds_io_cb *cb, int file_fd,
 
 	if (fstat(file_fd, &file_stat) < 0) {
 		err = -errno;
-		fprintf(stderr, "nds: fstat fd %d failed, errno: %d\n",
-			file_fd, err);
+		fprintf(stderr, "nds: fstat fd %d failed, errno: %d\n", file_fd, err);
 		return err;
 	}
 
-	err = p2p_prepare_io_extents(file_fd, &file_stat, cb->offset, io_size,
-				     &exts, &ext_num, &total_size);
+	err = p2p_prepare_io_extents(file_fd, &file_stat,
+				     cb->opcode == NDS_IO_OP_PWRITE ? P2P_IO_WRITE : P2P_IO_READ,
+				     cb->offset, io_size, &exts, &ext_num, &total_size);
 	if (err) {
 		fprintf(stderr, "nds: prepare extents failed, errno: %d\n", err);
 		return err;
 	}
 	if (!ext_num || total_size < io_size) {
-		fprintf(stderr, "nds: extent size %llu < IOV size %lu\n",
-			total_size, io_size);
+		fprintf(stderr, "nds: extent size %llu < IOV size %lu\n", total_size, io_size);
 		free(exts);
 		return -ENODATA;
 	}
@@ -449,15 +444,10 @@ static int nds_iocb_to_io_param(const struct nds_io_cb *cb, int file_fd,
 	return 0;
 }
 
-/*
- * One iocb → one IOCTL_RW_FILE (one logical completion). Multiple iovs in the
- * iocb are scatter-gather for that single event, not multiple events.
- */
-static int nds_submit_one_iocb(struct nds_io_ctx *ctx,
-			       const struct nds_io_cb *cb)
+static int nds_build_one_iocb(const struct nds_io_cb *cb,
+			      struct p2p_io_param *param,
+			      struct fiemap **exts_out)
 {
-	struct p2p_io_param param;
-	struct fiemap *exts = NULL;
 	int file_fd = cb->obj.fd;
 	int ret;
 
@@ -465,25 +455,21 @@ static int nds_submit_one_iocb(struct nds_io_ctx *ctx,
 	    file_fd < 0)
 		return -EINVAL;
 
-	ret = nds_iocb_to_io_param(cb, file_fd, &param, &exts);
-	if (ret) {
+	ret = nds_iocb_to_io_param(cb, file_fd, param, exts_out);
+	if (ret)
 		fprintf(stderr, "nds: translate iocb failed %d\n", ret);
-		return ret;
-	}
-
-	if (ioctl(ctx->p2p_fd, IOCTL_RW_FILE, &param) < 0) {
-		ret = -errno;
-		fprintf(stderr, "nds: rw ioctl failed %d\n", ret);
-	}
-	free(exts);
 	return ret;
 }
 
 int nds_io_submit(struct nds_io_ctx *ctx, int nr,
 		  const struct nds_io_cb *iocb)
 {
-	int accepted = 0;
-	int i;
+	struct p2p_io_batch_param batch = { 0 };
+	struct p2p_io_param *items;
+	struct fiemap **exts;
+	unsigned int built = 0;
+	unsigned int i;
+	int build_err = 0;
 	int ret;
 
 	if (!ctx || !iocb)
@@ -495,18 +481,47 @@ int nds_io_submit(struct nds_io_ctx *ctx, int nr,
 	if ((unsigned int)nr > NDS_IO_MAX_IO_CNT)
 		return -EINVAL;
 
-	/*
-	 * AIO-shaped fail-stop: submit iocbs in order, one ioctl each. On
-	 * partial success return the accepted count (errno of the failed
-	 * iocb is not returned). If nothing was accepted, return -errno.
-	 */
-	for (i = 0; i < nr; i++) {
-		ret = nds_submit_one_iocb(ctx, &iocb[i]);
-		if (ret)
-			return accepted ? accepted : ret;
-		accepted++;
+	items = calloc((size_t)nr, sizeof(*items));
+	exts = calloc((size_t)nr, sizeof(*exts));
+	if (!items || !exts) {
+		free(exts);
+		free(items);
+		return -ENOMEM;
 	}
-	return accepted;
+
+	/*
+	 * Build the valid prefix in iocb order, then submit its independent
+	 * requests through one ioctl. Translation and kernel acceptance are both
+	 * fail-stop: return the accepted prefix, or -errno if item zero fails.
+	 */
+	while (built < (unsigned int)nr) {
+		build_err = nds_build_one_iocb(&iocb[built], &items[built],
+					       &exts[built]);
+		if (build_err)
+			break;
+		built++;
+	}
+	if (!built) {
+		ret = build_err;
+		goto out;
+	}
+
+	batch.nr = built;
+	batch.items = (uint64_t)(uintptr_t)items;
+	ret = ioctl(ctx->p2p_fd, IOCTL_SUBMIT_IO, &batch);
+	if (ret < 0) {
+		ret = -errno;
+		fprintf(stderr, "nds: submit ioctl failed %d\n", ret);
+	} else if (!ret) {
+		ret = -EIO;
+	}
+
+out:
+	for (i = 0; i < built; i++)
+		free(exts[i]);
+	free(exts);
+	free(items);
+	return ret;
 }
 
 int nds_io_getevents(struct nds_io_ctx *ctx, int min_nr,
